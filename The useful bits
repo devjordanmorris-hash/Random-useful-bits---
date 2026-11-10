@@ -1,0 +1,332 @@
+// ============================================================================
+// residual_structure.h  —  reusable primitives from IMG22 / LIVE01B
+//
+//   * tolerance-grouped connected-component segmentation of a signed
+//     3-channel residual field (modal base + family count per component)
+//   * row-bounded run geometry (spans_of / put_spans / get_spans)
+//   * varint + fixed-width helpers
+//
+// Each primitive is standard on its own. The non-obvious parts are:
+//   - grouping residuals by per-channel *tolerance* (not equality) while
+//     remaining lossless at the codec level (tolerance is paid back by
+//     exact sibling/exception coding downstream)
+//   - row-boundary breaks in run geometry (required for 2D correctness)
+//   - delta-coded span starts across a component (compactness)
+//
+// MIT License. Copyright (c) 2026 <Jordwn Morris>, contributors.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included
+// in all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+// MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+// IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+// CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT
+// OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR
+// THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// ============================================================================
+#pragma once
+#include <cstdint>
+#include <cstddef>
+#include <cstring>
+#include <deque>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+#include <algorithm>
+
+// ---------------------------------------------------------------------------
+// small utilities
+// ---------------------------------------------------------------------------
+static inline int ai(int x){ return x < 0 ? -x : x; }
+
+static inline void put_u16(std::vector<uint8_t>& o, uint16_t v){
+    o.push_back(uint8_t(v));
+    o.push_back(uint8_t(v >> 8));
+}
+static inline uint16_t get_u16(const std::vector<uint8_t>& d, size_t& p){
+    if (p + 2 > d.size()) throw std::runtime_error("truncated u16");
+    uint16_t v = uint16_t(d[p]) | (uint16_t(d[p+1]) << 8);
+    p += 2;
+    return v;
+}
+static inline void put_i16(std::vector<uint8_t>& o, int v){
+    put_u16(o, uint16_t(int16_t(v)));
+}
+static inline int16_t get_i16(const std::vector<uint8_t>& d, size_t& p){
+    return int16_t(get_u16(d, p));
+}
+
+static inline void put_var(std::vector<uint8_t>& o, uint64_t x){
+    while (x >= 0x80){ o.push_back(uint8_t(x) | 0x80); x >>= 7; }
+    o.push_back(uint8_t(x));
+}
+static inline uint64_t get_var(const std::vector<uint8_t>& d, size_t& p){
+    uint64_t n = 0; int s = 0;
+    for (;;){
+        if (p >= d.size()) throw std::runtime_error("truncated varint");
+        uint8_t b = d[p++];
+        n |= uint64_t(b & 0x7F) << s;
+        if (!(b & 0x80)) return n;
+        s += 7;
+        if (s > 63) throw std::runtime_error("varint overflow");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Res3: signed 3-channel residual, with hash for use as a map key
+// ---------------------------------------------------------------------------
+struct Res3 {
+    int16_t r = 0, g = 0, b = 0;
+    bool zero() const { return r == 0 && g == 0 && b == 0; }
+    bool operator==(const Res3& o) const {
+        return r == o.r && g == o.g && b == o.b;
+    }
+};
+struct ResHash {
+    size_t operator()(const Res3& v) const noexcept {
+        uint64_t x = uint16_t(v.r)
+                   | (uint64_t(uint16_t(v.g)) << 16)
+                   | (uint64_t(uint16_t(v.b)) << 32);
+        x ^= x >> 33; x *= 0xff51afd7ed558ccdULL;
+        x ^= x >> 33; x *= 0xc4ceb9fe1a85ec53ULL;
+        x ^= x >> 33;
+        return size_t(x);
+    }
+};
+static inline bool close_res(const Res3& a, const Res3& b, int bound){
+    return ai(int(a.r) - int(b.r)) <= bound &&
+           ai(int(a.g) - int(b.g)) <= bound &&
+           ai(int(a.b) - int(b.b)) <= bound;
+}
+
+// ---------------------------------------------------------------------------
+// Component: a tolerance-grouped blob of residual pixels
+// ---------------------------------------------------------------------------
+struct Component {
+    std::vector<uint32_t> members;   // pixel indices, sorted
+    Res3 base{};                     // modal residual
+    uint32_t familyCount = 0;        // members within `bound` of base
+};
+
+// Tolerance-grouped connected-component segmentation of a signed 3-channel
+// residual field. Zero residuals are treated as background and skipped.
+// `connectivity` is 4 or 8. `bound` is the per-channel tolerance used to
+// decide whether two adjacent nonzero residuals belong to the same blob.
+//
+// Each component gets:
+//   - members: sorted pixel indices
+//   - base:    the most frequent residual in the component (ties broken by
+//              lexicographic (r,g,b) for determinism)
+//   - familyCount: number of members within `bound` of base
+//
+// Downstream, components whose familyCount / size falls below a dominance
+// threshold should be rejected (their members go to a raw fallback), which
+// is what keeps the representation lossless.
+static std::vector<Component> make_components(
+    const std::vector<Res3>& res,
+    int width, int height,
+    int connectivity,
+    int bound
+){
+    std::vector<uint8_t> seen(res.size(), 0);
+    std::deque<uint32_t> q;
+    std::vector<Component> out;
+    static const int dx[8] = { 1, -1, 0,  0, 1,  1, -1, -1 };
+    static const int dy[8] = { 0,  0, 1, -1, 1, -1,  1, -1 };
+    const int nk = (connectivity == 8) ? 8 : 4;
+
+    for (uint32_t seed = 0; seed < res.size(); ++seed){
+        if (seen[seed] || res[seed].zero()) continue;
+        seen[seed] = 1;
+        q.clear();
+        q.push_back(seed);
+
+        Component c;
+        std::unordered_map<Res3, uint32_t, ResHash> hist;
+        hist.reserve(32);
+
+        while (!q.empty()){
+            uint32_t at = q.front(); q.pop_front();
+            c.members.push_back(at);
+            ++hist[res[at]];
+            int x = int(at % uint32_t(width));
+            int y = int(at / uint32_t(width));
+            for (int k = 0; k < nk; ++k){
+                int nx = x + dx[k], ny = y + dy[k];
+                if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+                uint32_t np = uint32_t(ny * width + nx);
+                if (seen[np] || res[np].zero()) continue;
+                if (close_res(res[at], res[np], bound)){
+                    seen[np] = 1;
+                    q.push_back(np);
+                }
+            }
+        }
+
+        std::sort(c.members.begin(), c.members.end());
+
+        bool have = false;
+        uint32_t bestN = 0;
+        for (const auto& kv : hist){
+            if (!have || kv.second > bestN ||
+                (kv.second == bestN &&
+                 std::tie(kv.first.r, kv.first.g, kv.first.b) <
+                 std::tie(c.base.r, c.base.g, c.base.b))){
+                c.base = kv.first;
+                bestN = kv.second;
+                have = true;
+            }
+        }
+        uint32_t family = 0;
+        for (uint32_t p : c.members)
+            if (close_res(res[p], c.base, bound)) ++family;
+        c.familyCount = family;
+        out.push_back(std::move(c));
+    }
+    return out;
+}
+
+// ---------------------------------------------------------------------------
+// Row-bounded run geometry
+//
+// spans_of turns a sorted list of pixel positions into (start, length) runs.
+// Runs are broken at row boundaries so a span never straddles two rows.
+// put_spans / get_spans are the matched encoder/decoder pair; span starts
+// are delta-coded across the component (first span absolute, then deltas).
+// ---------------------------------------------------------------------------
+static std::vector<std::pair<uint32_t, uint32_t>> spans_of(
+    const std::vector<uint32_t>& pos, int width
+){
+    std::vector<std::pair<uint32_t, uint32_t>> spans;
+    for (size_t i = 0; i < pos.size(); ){
+        uint32_t st = pos[i], len = 1;
+        int row = int(st / uint32_t(width));
+        while (i + len < pos.size() &&
+               pos[i + len] == st + len &&
+               int(pos[i + len] / uint32_t(width)) == row) ++len;
+        spans.push_back({ st, len });
+        i += len;
+    }
+    return spans;
+}
+
+static void put_spans(
+    std::vector<uint8_t>& o,
+    const std::vector<std::pair<uint32_t, uint32_t>>& spans
+){
+    put_var(o, spans.size());
+    uint32_t prev = 0;
+    for (size_t i = 0; i < spans.size(); ++i){
+        uint32_t st = spans[i].first;
+        put_var(o, i == 0 ? st : st - prev);
+        put_var(o, spans[i].second);
+        prev = st;
+    }
+}
+
+static std::vector<std::pair<uint32_t, uint32_t>> get_spans(
+    const std::vector<uint8_t>& d, size_t& p, size_t pixelCount
+){
+    uint64_t count = get_var(d, p);
+    std::vector<std::pair<uint32_t, uint32_t>> spans;
+    spans.reserve(size_t(count));
+    uint32_t prev = 0;
+    for (uint64_t i = 0; i < count; ++i){
+        uint64_t delta = get_var(d, p);
+        uint64_t len   = get_var(d, p);
+        uint64_t st    = (i == 0 ? delta : uint64_t(prev) + delta);
+        if (st >= pixelCount || len == 0 || st + len > pixelCount)
+            throw std::runtime_error("invalid decoded span");
+        spans.push_back({ uint32_t(st), uint32_t(len) });
+        prev = uint32_t(st);
+    }
+    return spans;
+}
+
+// ---------------------------------------------------------------------------
+// Three-tier residual model (format sketch — adapt to your packet framing)
+//
+// For an accepted component with base B:
+//   tier 1 (base):      B applied to every member span
+//   tier 2 (siblings):  each residual value occurring >= 2 times, stored as
+//                       delta from B, with its own spans
+//   tier 3 (exceptions): singleton residuals, stored as position delta +
+//                       residual delta from B
+//
+// Lossless because every member is either covered by a span at B, a sibling
+// value, or an exact exception. Compact when residuals cluster around B.
+// The sibling dictionary is frequency-sorted; exceptions are position-sorted.
+//
+// This is a *format*, not a drop-in function: it depends on your packet
+// header, varint layer, and receiver contract. The reusable insight is the
+// tiering itself — reify the residual histogram into explicit structural
+// fields before entropy coding, rather than entropy-coding the raw stream.
+// ---------------------------------------------------------------------------
+
+// Example: encode one accepted component into a semantic byte vector.
+// (Packet framing, frame index, and JW1 wrapper are elided.)
+static void encode_component_body(
+    std::vector<uint8_t>& semantic,
+    const Component& c,
+    const std::vector<Res3>& res,
+    int width
+){
+    put_i16(semantic, c.base.r);
+    put_i16(semantic, c.base.g);
+    put_i16(semantic, c.base.b);
+    put_spans(semantic, spans_of(c.members, width));
+
+    std::unordered_map<Res3, std::vector<uint32_t>, ResHash> byValue;
+    byValue.reserve(32);
+    for (uint32_t p : c.members)
+        if (!(res[p] == c.base)) byValue[res[p]].push_back(p);
+
+    std::vector<std::pair<Res3, std::vector<uint32_t>>> siblings;
+    std::vector<std::pair<uint32_t, Res3>> exceptions;
+    for (auto& kv : byValue){
+        if (kv.second.size() >= 2)
+            siblings.push_back({ kv.first, std::move(kv.second) });
+        else
+            for (uint32_t p : kv.second)
+                exceptions.push_back({ p, kv.first });
+    }
+
+    std::sort(siblings.begin(), siblings.end(),
+        [](const auto& a, const auto& b){
+            if (a.second.size() != b.second.size())
+                return a.second.size() > b.second.size();
+            return std::tie(a.first.r, a.first.g, a.first.b) <
+                   std::tie(b.first.r, b.first.g, b.first.b);
+        });
+    std::sort(exceptions.begin(), exceptions.end(),
+        [](const auto& a, const auto& b){ return a.first < b.first; });
+
+    put_var(semantic, siblings.size());
+    for (auto& s : siblings){
+        put_i16(semantic, int(s.first.r) - int(c.base.r));
+        put_i16(semantic, int(s.first.g) - int(c.base.g));
+        put_i16(semantic, int(s.first.b) - int(c.base.b));
+        put_spans(semantic, spans_of(s.second, width));
+    }
+
+    put_var(semantic, exceptions.size());
+    uint32_t prev = 0;
+    for (size_t i = 0; i < exceptions.size(); ++i){
+        uint32_t p = exceptions[i].first;
+        put_var(semantic, i == 0 ? p : p - prev);
+        put_i16(semantic, int(exceptions[i].second.r) - int(c.base.r));
+        put_i16(semantic, int(exceptions[i].second.g) - int(c.base.g));
+        put_i16(semantic, int(exceptions[i].second.b) - int(c.base.b));
+        prev = p;
+    }
+}
